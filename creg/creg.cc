@@ -1006,6 +1006,7 @@ int main(int argc, char** argv) {
           cout << endl;
         }
       }
+    }
   } else {                     // logistic regression
     weights.resize((1 + FD::NumFeats()) * (labels.size() - 1), 0.0);
     cerr << "       Number of parameters: " << weights.size() << endl;
