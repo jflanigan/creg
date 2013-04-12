@@ -29,6 +29,7 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
   opts.add_options()
         ("linear,n", "Linear regression (default is multiclass logistic regression)")
         ("ordinal,o", "Ordinal regression (proportional odds)")
+        ("risk,r", "Risk loss")
         ("training_features,x", po::value<vector<string> >(), "Files containing training instance features")
         ("training_responses,y", po::value<string>(), "File containing training instance responses (if unspecified, do prediction only)")
         ("tx", po::value<vector<string> >(), "File containing test instance features")
@@ -565,6 +566,113 @@ struct MulticlassLogLoss : public BaseLoss {
   const double T; // temperature for entropy regularization
 };
 
+struct RiskLoss : public BaseLoss {
+
+  // weight vector layout for K classes, with p features
+  //   w[0 : K-2] = bias weights
+  //   w[y*p + K-1 : y*p + K + p - 2] = feature weights for y^th class
+
+  RiskLoss(
+          const vector<TrainingInstance>& tr,
+          unsigned k,
+          unsigned numfeats,
+          const double l2) : BaseLoss(tr, k, numfeats, l2) {}
+
+  // evaluate log loss and gradient
+  double operator()(const vector<double>& x, double* g) const {
+    fill(g, g + x.size(), 0.0);
+    vector<double> dotprods(K - 1);  // K-1 degrees of freedom
+    vector<prob_t> probs(K);
+    double cll = 0;
+    for (unsigned i = 0; i < training.size(); ++i) {
+      const FrozenFeatureMap& fmapx = training[i].x;
+      const unsigned refy = training[i].y.label;
+      ComputeDotProducts(fmapx, x, &dotprods);
+      prob_t z;
+      for (unsigned j = 0; j < dotprods.size(); ++j)
+        z += (probs[j] = prob_t(dotprods[j], init_lnx()));
+      z += (probs.back() = prob_t::One());
+      for (unsigned y = 0; y < probs.size(); ++y) {
+        probs[y] /= z;
+        //cerr << "  p(y=" << y << ")=" << probs[y].as_float() << "\tz=" << z << endl;
+      }
+      cll -= log(probs[refy]);  // log p(y | x)
+
+      for (unsigned y = 0; y < dotprods.size(); ++y) {
+        double scale = probs[y].as_float();
+        if (y == refy) { scale -= 1.0; }
+        GradAdd(fmapx, y, scale, g);
+      }
+    }
+    double reg = ApplyRegularizationTerms(x, g);
+    return cll + reg;
+  }
+
+  template <class FeatureMapType>
+  pair<unsigned, double> Predict(const FeatureMapType& fx,
+                                 const vector<double>& w,
+                                 MulticlassPrediction* pred = NULL) const {
+    vector<double> dotprods(K - 1);  // K-1 degrees of freedom
+    if (pred) pred->posterior.resize(K);
+    ComputeDotProducts(fx, w, &dotprods);
+    prob_t z = prob_t::One();  // exp(0) for k^th class
+    for (unsigned j = 0; j < dotprods.size(); ++j)
+      z += prob_t(dotprods[j], init_lnx());
+    const double log_z = log(z);
+    double best = 0;
+    unsigned besty = dotprods.size();
+    for (unsigned y = 0; y < dotprods.size(); ++y) {
+      if (dotprods[y] > best) { best = dotprods[y]; besty = y; }
+      if (pred) pred->posterior[y] = exp(dotprods[y] - log_z);
+    }
+    if (pred) {
+      pred->posterior.back() = exp(-log_z);
+      pred->y_hat = besty;
+    }
+    return make_pair(besty, exp(best - log_z));
+  }
+
+  double Evaluate(const vector<TrainingInstance>& test,
+                  const vector<double>& w,
+                  double thresh_p,
+		  vector<MulticlassPrediction>* preds = NULL) const {
+    double correct = 0;
+    unsigned examples = 0;
+    if (preds) preds->resize(test.size());
+    for (unsigned i = 0; i < test.size(); ++i) {
+      MulticlassPrediction* ppred = NULL;
+      if (preds) ppred = &(*preds)[i];
+      const pair<unsigned, double> pred = Predict(test[i].x, w, ppred);
+      const unsigned predy = pred.first;
+      const unsigned refy = test[i].y.label;
+      // cerr << "line=" << (i+1) << " true=" << refy << " pred=" << predy << "  p(y|x) = " << pred.second << endl;
+      if (pred.second >= thresh_p) {
+        ++examples;
+        if (refy == predy) ++correct;
+      }
+    }
+    return correct / examples;
+  }
+
+  template <class FeatureMapType>
+  void ComputeDotProducts(const FeatureMapType& fx,  // feature vector of x
+                          const vector<double>& w,         // full weight vector
+                          vector<double>* pdotprods) const {
+    vector<double>& dotprods = *pdotprods;
+    const unsigned km1 = K - 1;
+    dotprods.resize(km1);
+    for (unsigned y = 0; y < km1; ++y)
+      dotprods[y] = w[y];  // bias terms
+    for (typename FeatureMapType::const_iterator it = fx.begin(); it != fx.end(); ++it) {
+      const float fval = it->second;
+      const unsigned fid = it->first;
+      for (unsigned y = 0; y < km1; ++y)
+        dotprods[y] += w[fid + y * p + km1] * fval;
+    }
+  }
+};
+
+
 struct OrdinalLogLoss : public BaseLoss {
 
   // weight vector layout for K levels, with p features
@@ -869,6 +977,35 @@ int main(int argc, char** argv) {
         if (w) *out << FD::Convert(f) << "\t" << w << endl;
       }
     }
+  } else if (conf.count("risk")) {  // Risk
+    weights.resize((1 + FD::NumFeats()) * (labels.size() - 1), 0.0);
+    cerr << "       Number of parameters: " << weights.size() << endl;
+    cerr << "           Number of labels: " << labels.size() << endl;
+    const unsigned K = labels.size();
+    const unsigned km1 = K - 1;
+    RiskLoss loss(training, K, p, l2);
+    if (do_training) {
+      LearnParameters(loss, l1, km1, memory_buffers, epsilon, delta, &weights);
+    }
+
+    if (test.size()) {
+      vector<MulticlassPrediction> predictions;
+      double acc = loss.Evaluate(test, weights, p_thresh, &predictions);
+      if (test_labels) {
+        cerr << "Held-out accuracy: " << acc << endl;
+      }
+      if (!test_labels || write_dist || write_pps) {
+        for (unsigned i = 0; i < test.size(); ++i) {
+          cout << test_ids[i] << '\t' << labels[predictions[i].y_hat];
+          if (write_dist) {
+            cout << "\t{";
+            for (unsigned y = 0; y < K; ++y)
+              cout << (y ? ", " : "") << '"' << labels[y] << "\": " << predictions[i].posterior[y];
+            cout << '}';
+          }
+          cout << endl;
+        }
+      }
   } else {                     // logistic regression
     weights.resize((1 + FD::NumFeats()) * (labels.size() - 1), 0.0);
     cerr << "       Number of parameters: " << weights.size() << endl;
