@@ -579,7 +579,7 @@ struct RiskLoss : public BaseLoss {
           const double l2) : BaseLoss(tr, k, numfeats, l2) {}
 
   // evaluate log loss and gradient
-  double operator()(const vector<double>& x, double* g) const {
+  double operator()(const vector<double>& x, double* g) const {  // x is current weights (w)
     fill(g, g + x.size(), 0.0);
     vector<double> dotprods(K - 1);  // K-1 degrees of freedom
     vector<prob_t> probs(K);
