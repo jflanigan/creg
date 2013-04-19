@@ -5,6 +5,8 @@
 #include <tr1/unordered_map>
 #include <limits>
 #include <cmath>
+#include <time.h>
+#include <stdlib.h>
 
 #include <signal.h>
 
@@ -583,7 +585,7 @@ struct RiskLoss : public BaseLoss {
     fill(g, g + x.size(), 0.0);
     vector<double> dotprods(K - 1);  // K-1 degrees of freedom
     vector<prob_t> probs(K);
-    double cll = 0;
+    double risk = 0;
     for (unsigned i = 0; i < training.size(); ++i) {
       const FrozenFeatureMap& fmapx = training[i].x;
       const unsigned refy = training[i].y.label;
@@ -596,16 +598,23 @@ struct RiskLoss : public BaseLoss {
         probs[y] /= z;
         //cerr << "  p(y=" << y << ")=" << probs[y].as_float() << "\tz=" << z << endl;
       }
-      cll -= log(probs[refy]);  // log p(y | x)
+      risk -= probs[refy].as_float();  // log p(y | x)
 
+      //GradAdd(fmapx, refy, -probs[refy].as_float(), g);
       for (unsigned y = 0; y < dotprods.size(); ++y) {
         double scale = probs[y].as_float();
         if (y == refy) { scale -= 1.0; }
-        GradAdd(fmapx, y, scale, g);
+        GradAdd(fmapx, y, scale * probs[refy].as_float(), g);
       }
+
+      //for (unsigned y = 0; y < dotprods.size(); ++y) {
+      //  double scale = probs[y].as_float() * probs[refy].as_float();
+      //  if (y == refy) { scale -= probs[refy].as_float(); }
+      //  GradAdd(fmapx, y, scale, g);
+      //}
     }
     double reg = ApplyRegularizationTerms(x, g);
-    return cll + reg;
+    return risk + reg;
   }
 
   template <class FeatureMapType>
@@ -981,6 +990,13 @@ int main(int argc, char** argv) {
     weights.resize((1 + FD::NumFeats()) * (labels.size() - 1), 0.0);
     cerr << "       Number of parameters: " << weights.size() << endl;
     cerr << "           Number of labels: " << labels.size() << endl;
+    srand((int) time(NULL));
+    if (!conf.count("weights")) {
+      for (unsigned i = 0; i < weights.size(); ++i) {
+        weights[i] = ((double) rand() / ((double) RAND_MAX + 1)) - .5;
+      }
+    }
+
     const unsigned K = labels.size();
     const unsigned km1 = K - 1;
     RiskLoss loss(training, K, p, l2);
@@ -1004,6 +1020,21 @@ int main(int argc, char** argv) {
             cout << '}';
           }
           cout << endl;
+        }
+      }
+    }
+    if (out) {
+      *out << K << "\t***CATEGORICAL***";
+      for (unsigned y = 0; y < K; ++y)
+        *out << '\t' << labels[y];
+      *out << endl;
+      for (unsigned y = 0; y < km1; ++y)
+        *out << labels[y] << "\t***BIAS***\t" << weights[y] << endl;
+      for (unsigned y = 0; y < km1; ++y) {
+        for (unsigned f = 0; f < p; ++f) {
+          const double w = weights[km1 + y * p + f];
+          if (w)
+            *out << labels[y] << "\t" << FD::Convert(f) << "\t" << w << endl;
         }
       }
     }
